@@ -39,12 +39,12 @@ jobs:
 
     steps:
       - name: Descargar repositorio
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Preparar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+        uses: actions/setup-python@v6
+      with:
+            python-version: "3.12"
 
       - name: Instalar OCI CLI
         run: |
