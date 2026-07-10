@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # Cada 10 minutos, evitando el minuto 0 de cada hora.
-    - cron: "7,17,27,37,47,57 * * * *"
+    - cron: "3-59/10 * * * *"
 
 permissions:
   contents: read
