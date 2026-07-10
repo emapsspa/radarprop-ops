@@ -43,7 +43,7 @@ jobs:
 
       - name: Preparar Python
         uses: actions/setup-python@v6
-      with:
+        with:
             python-version: "3.12"
 
       - name: Instalar OCI CLI
