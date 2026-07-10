@@ -2,9 +2,6 @@ name: RadarProp OCI A1 Capacity Hunter
 
 on:
   workflow_dispatch:
-  schedule:
-    # Cada 10 minutos, evitando el minuto 0 de cada hora.
-    - cron: "3-59/10 * * * *"
 
 permissions:
   contents: read
@@ -17,8 +14,16 @@ concurrency:
 jobs:
   try-launch:
     name: Intentar crear VM.Standard.A1.Flex
+
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+
+    # Da margen suficiente para:
+    # - instalar OCI CLI
+    # - intentar crear la VM
+    # - esperar 10 minutos si no hay capacidad
+    # - lanzar el siguiente workflow
+    # - esperar RUNNING si la instancia se crea
+    timeout-minutes: 40
 
     env:
       OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
@@ -38,19 +43,44 @@ jobs:
       DISPLAY_NAME: ${{ vars.DISPLAY_NAME || 'radarprop-prod-01' }}
 
     steps:
+      # ============================================================
+      # 1. DESCARGAR REPOSITORIO
+      # ============================================================
+
       - name: Descargar repositorio
         uses: actions/checkout@v6
+
+
+      # ============================================================
+      # 2. PREPARAR PYTHON
+      # ============================================================
 
       - name: Preparar Python
         uses: actions/setup-python@v6
         with:
-            python-version: "3.12"
+          python-version: "3.12"
+
+
+      # ============================================================
+      # 3. INSTALAR OCI CLI
+      # ============================================================
 
       - name: Instalar OCI CLI
+        shell: bash
         run: |
+          set -euo pipefail
+
           python -m pip install --upgrade pip
           python -m pip install oci-cli
+
+          echo
+          echo "Versión OCI CLI:"
           oci --version
+
+
+      # ============================================================
+      # 4. VALIDAR SECRETOS Y VARIABLES
+      # ============================================================
 
       - name: Validar secretos y variables
         shell: bash
@@ -74,60 +104,192 @@ jobs:
           )
 
           for name in "${required[@]}"; do
+
             if [[ -z "${!name:-}" ]]; then
               echo "::error::La variable o secreto $name está vacío."
               exit 10
             fi
+
           done
 
           case "$COMPARTMENT_ID" in
-            ocid1.compartment.*) ;;
-            *) echo "::error::COMPARTMENT_ID no parece un OCID válido."; exit 11 ;;
+            ocid1.compartment.*)
+              ;;
+            *)
+              echo "::error::COMPARTMENT_ID no parece un OCID válido."
+              exit 11
+              ;;
           esac
 
           case "$IMAGE_ID" in
-            ocid1.image.*) ;;
-            *) echo "::error::IMAGE_ID no parece un OCID válido."; exit 12 ;;
+            ocid1.image.*)
+              ;;
+            *)
+              echo "::error::IMAGE_ID no parece un OCID válido."
+              exit 12
+              ;;
           esac
 
           case "$SUBNET_ID" in
-            ocid1.subnet.*) ;;
-            *) echo "::error::SUBNET_ID no parece un OCID válido."; exit 13 ;;
+            ocid1.subnet.*)
+              ;;
+            *)
+              echo "::error::SUBNET_ID no parece un OCID válido."
+              exit 13
+              ;;
           esac
 
-          printf '%s\n' "$SSH_PUBLIC_KEY" > "$RUNNER_TEMP/radarprop_ssh.pub"
+          printf '%s\n' "$SSH_PUBLIC_KEY" \
+            > "$RUNNER_TEMP/radarprop_ssh.pub"
+
           chmod 600 "$RUNNER_TEMP/radarprop_ssh.pub"
 
-          echo "SSH_KEY_FILE=$RUNNER_TEMP/radarprop_ssh.pub" >> "$GITHUB_ENV"
+          echo \
+            "SSH_KEY_FILE=$RUNNER_TEMP/radarprop_ssh.pub" \
+            >> "$GITHUB_ENV"
+
+          echo
+          echo "Validación completada correctamente."
+
+
+      # ============================================================
+      # 5. VERIFICAR AUTENTICACIÓN OCI
+      # ============================================================
 
       - name: Verificar autenticación OCI
+        shell: bash
         run: |
           set -euo pipefail
+
+          echo "Verificando conexión con OCI..."
+
           oci iam region-subscription list \
             --tenancy-id "$OCI_CLI_TENANCY" \
             --query 'data[0]."region-name"' \
-            --raw-output >/dev/null
+            --raw-output
+
+          echo
+          echo "Autenticación OCI correcta."
+
+
+      # ============================================================
+      # 6. INTENTAR CREAR LA INSTANCIA A1
+      # ============================================================
 
       - name: Intentar lanzamiento A1
         id: launch
         shell: bash
         run: |
+          set -euo pipefail
+
           chmod +x scripts/oci_try_launch.sh
+
           scripts/oci_try_launch.sh
 
-      - name: Desactivar scheduler al conseguir la instancia
-        if: steps.launch.outputs.instance_ready == 'true'
+
+      # ============================================================
+      # 7. PROGRAMAR SIGUIENTE INTENTO
+      #
+      # Solo ocurre si:
+      # capacity_wait == true
+      #
+      # Es decir:
+      # - Out of host capacity
+      # - Out of capacity
+      # - 429
+      # - TooManyRequests
+      # ============================================================
+
+      - name: Esperar y programar siguiente intento
+        if: steps.launch.outputs.capacity_wait == 'true'
+
         env:
           GH_TOKEN: ${{ github.token }}
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "=================================================="
+          echo "RADARPROP OCI A1"
+          echo "=================================================="
+          echo
+          echo "OCI no tiene capacidad A1 disponible."
+          echo
+          echo "Esperando 10 minutos antes del siguiente intento..."
+          echo
+
+          sleep 600
+
+          echo
+          echo "Solicitando una nueva ejecución del workflow..."
+
+          DISPATCH_OK=false
+
+          for attempt in 1 2 3; do
+
+            echo
+            echo "Intento de dispatch: $attempt"
+
+            if gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/oci-a1-launch.yml/dispatches" \
+              -f ref=main
+            then
+              DISPATCH_OK=true
+              break
+            fi
+
+            echo
+            echo "El dispatch falló temporalmente."
+            echo "Reintentando en 20 segundos..."
+
+            sleep 20
+
+          done
+
+          if [[ "$DISPATCH_OK" != "true" ]]; then
+            echo
+            echo "::error::No fue posible iniciar la siguiente ejecución."
+            exit 30
+          fi
+
+          echo
+          echo "=================================================="
+          echo "SIGUIENTE INTENTO PROGRAMADO"
+          echo "=================================================="
+
+
+      # ============================================================
+      # 8. MENSAJE DE ÉXITO
+      #
+      # Si la instancia fue creada:
+      # - NO se dispara otro workflow
+      # - la cadena se detiene automáticamente
+      # ============================================================
+
+      - name: RadarProp aprovisionado
+        if: steps.launch.outputs.instance_ready == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Instancia lista. Intentando desactivar la programación automática..."
-
-          gh api \
-            --method PUT \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${GITHUB_REPOSITORY}/actions/workflows/oci-a1-launch.yml/disable" \
-            && echo "Workflow desactivado correctamente." \
-            || echo "::warning::No se pudo desactivar el workflow. Los siguientes intentos detectarán la instancia existente y no crearán duplicados."
+          echo
+          echo "##################################################"
+          echo "#                                                #"
+          echo "#          RADARPROP A1 DISPONIBLE              #"
+          echo "#                                                #"
+          echo "##################################################"
+          echo
+          echo "La instancia fue creada correctamente."
+          echo
+          echo "No se programarán más intentos automáticos."
+          echo
+          echo "Revisa el resumen del job para obtener:"
+          echo
+          echo "- estado"
+          echo "- OCID"
+          echo "- IP pública"
