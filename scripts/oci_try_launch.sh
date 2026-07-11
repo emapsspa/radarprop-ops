@@ -93,7 +93,8 @@ if [[ -n "$EXISTING_ID" ]]; then
   summary "- Estado: \`$EXISTING_STATE\`"
   summary "- OCID: \`$EXISTING_ID\`"
 
-  if [[ "$EXISTING_STATE" == "RUNNING" ]]; then
+   if [[ "$EXISTING_STATE" == "RUNNING" ]]; then
+
     PUBLIC_IP="$(
       oci compute instance list-vnics \
         --instance-id "$EXISTING_ID" \
@@ -102,11 +103,28 @@ if [[ -n "$EXISTING_ID" ]]; then
     )"
 
     echo "IP pública: $PUBLIC_IP"
+
     set_output "public_ip" "$PUBLIC_IP"
     set_output "instance_ready" "true"
+    set_output "capacity_wait" "false"
+
     summary "- IP pública: \`$PUBLIC_IP\`"
+
   else
+
+    echo
+    echo "La instancia existe pero todavía no está RUNNING."
+    echo "Estado actual: $EXISTING_STATE"
+    echo "Se programará una nueva comprobación automática."
+
     set_output "instance_ready" "false"
+    set_output "capacity_wait" "true"
+
+    summary ""
+    summary "La instancia todavía está en estado \`$EXISTING_STATE\`."
+    summary ""
+    summary "Se realizará una nueva comprobación automática."
+
   fi
 
   exit 0
@@ -181,10 +199,19 @@ fi
 ERROR_TEXT="$(cat "$ERROR_FILE")"
 printf '%s\n' "$ERROR_TEXT"
 
-if grep -qiE "Out of host capacity|Out of capacity" <<< "$ERROR_TEXT"; then
+
+# ============================================================
+# 1. SIN CAPACIDAD OCI
+# ============================================================
+
+if grep -qiE \
+  "Out of host capacity|Out of capacity" \
+  <<< "$ERROR_TEXT"
+then
+
   echo
   echo "[CAPACIDAD] OCI todavía no tiene capacidad A1 disponible."
-  echo "La siguiente ejecución programada volverá a intentarlo."
+  echo "La siguiente ejecución automática volverá a intentarlo."
 
   set_output "instance_exists" "false"
   set_output "instance_ready" "false"
@@ -194,15 +221,24 @@ if grep -qiE "Out of host capacity|Out of capacity" <<< "$ERROR_TEXT"; then
   summary ""
   summary "⏳ Sin capacidad A1 disponible en este intento."
   summary ""
-  summary "La siguiente ejecución programada volverá a intentarlo."
+  summary "La siguiente ejecución automática volverá a intentarlo."
 
   exit 0
 fi
 
-if grep -qiE "TooManyRequests|429" <<< "$ERROR_TEXT"; then
+
+# ============================================================
+# 2. THROTTLING OCI
+# ============================================================
+
+if grep -qiE \
+  "TooManyRequests|429" \
+  <<< "$ERROR_TEXT"
+then
+
   echo
   echo "[THROTTLING] OCI limitó temporalmente las solicitudes."
-  echo "La siguiente ejecución programada volverá a intentarlo."
+  echo "La siguiente ejecución automática volverá a intentarlo."
 
   set_output "instance_exists" "false"
   set_output "instance_ready" "false"
@@ -212,16 +248,62 @@ if grep -qiE "TooManyRequests|429" <<< "$ERROR_TEXT"; then
   summary ""
   summary "⏳ OCI aplicó limitación temporal."
   summary ""
-  summary "La siguiente ejecución programada volverá a intentarlo."
+  summary "La siguiente ejecución automática volverá a intentarlo."
 
   exit 0
 fi
 
+
+# ============================================================
+# 3. ERROR TRANSITORIO DE RED / ENDPOINT
+# ============================================================
+
+if grep -qiE \
+  "RequestException|connection to endpoint timed out|timed out|Timeout|ConnectTimeout|ReadTimeout|ConnectionError|Connection reset|RemoteDisconnected|Temporary failure in name resolution|Name or service not known|ServiceUnavailable|Bad Gateway|Gateway Timeout|HTTP 502|HTTP 503|HTTP 504" \
+  <<< "$ERROR_TEXT"
+then
+
+  echo
+  echo "[RED] Error temporal de conexión con OCI."
+  echo
+  echo "El error NO se considera una configuración inválida."
+  echo "La cadena continuará automáticamente."
+  echo
+
+  set_output "instance_exists" "false"
+  set_output "instance_ready" "false"
+  set_output "capacity_wait" "true"
+
+  summary "## RadarProp OCI"
+  summary ""
+  summary "🌐 Error temporal de conexión con OCI."
+  summary ""
+  summary "La ejecución no se considera fallida."
+  summary ""
+  summary "Se realizará un nuevo intento automáticamente."
+
+  exit 0
+fi
+
+
+# ============================================================
+# 4. ERROR REAL DE CONFIGURACIÓN O SERVICIO
+# ============================================================
+
 echo
 echo "=================================================="
-echo "ERROR NO RELACIONADO CON CAPACIDAD"
+echo "ERROR NO RECUPERABLE"
 echo "=================================================="
-echo "El workflow falla deliberadamente para evitar repetir una configuración incorrecta."
+echo
+echo "El error no corresponde a:"
+echo
+echo "- falta de capacidad"
+echo "- throttling"
+echo "- timeout"
+echo "- error temporal de red"
+echo
+echo "La automatización se detiene para evitar repetir"
+echo "una posible configuración incorrecta."
 
 set_output "instance_exists" "false"
 set_output "instance_ready" "false"
@@ -229,6 +311,8 @@ set_output "capacity_wait" "false"
 
 summary "## ❌ Error de configuración o servicio"
 summary ""
-summary "El error no corresponde a falta de capacidad. Revisa el log de la ejecución."
+summary "El error no corresponde a una condición temporal conocida."
+summary ""
+summary "Revisa el log de la ejecución."
 
 exit 1
